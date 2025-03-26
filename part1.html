@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>tor integration security notes</title>
+</head>
+<body>
+    <h1>tor integration security notes - some guy's thoughts</h1>
+
+    <section>
+        <h2>file: tor/constants.cc</h2>
+        <p>just looking at names of stuff.</p>
+        <pre><code>// the filename for the tor client config file.
+constexpr base::filepath::stringviewtype ktorrcfilename =
+    file_path_literal("tor-torrc");
+</code></pre>
+        <p>line 16: name of the tor config file. gotta know this.</p>
+        <pre><code>base::filepath getuserdatadir() {
+#if buildflag(is_win)
+  // the switch used to set a custom user data dir.
+  constexpr char kuserdatadir[] = "user-data-dir";
+  // it is not very clear why, but only on windows `pathservice` user dir wasn't
+  // getting overridden when passing `kuserdatadir`, so we only check for the
+  // switch on windows where the problem occurs.
+  base::commandline* command_line = base::commandline::forcurrentprocess();
+  base::filepath user_data_dir = command_line->getswitchvaluepath(kuserdatadir);
+  if (!user_data_dir.empty()) {
+    return user_data_dir;
+  }
+#endif  // buildflag(is_win)
+  return base::pathservice::checkedget(component_updater::dir_component_user);
+}
+</code></pre>
+        <p>lines 20-37: where the browser keeps your stuff. weird thing for windows with that command line thing. maybe someone can mess with that?</p>
+        <pre><code>base::filepath gettorclientdirectory() {
+  return getuserdatadir().appendascii(ktorclientcomponentid);
+}
+
+base::filepath getclientexecutablepath(const base::safebasename& install_dir,
+                                       const base::safebasename& executable) {
+  return gettorclientdirectory()
+      .append(install_dir.path())
+      .append(executable.path());
+}
+
+base::filepath gettorrcpath(const base::safebasename& install_dir) {
+  return gettorclientdirectory()
+      .append(install_dir.path())
+      .append(ktorrcfilename);
+}
+
+base::filepath gettordatapath() {
+  return getuserdatadir()
+      .append(file_path_literal("tor"))
+      .append(file_path_literal("data"));
+}
+
+base::filepath gettorwatchpath() {
+  return getuserdatadir()
+      .append(file_path_literal("tor"))
+      .append(file_path_literal("watch"));
+}
+</code></pre>
+        <p>lines 41-65: where tor files go. 'watch' path sounds like it watches for something. maybe when tor starts?</p>
+    </section>
+
+    <section>
+        <h2>file: tor_launcher_factory.h</h2>
+        <p>this looks like how the browser starts tor.</p>
+        <pre><code>virtual void launchtorprocess(const tor::mojom::torconfig& config);
+virtual void killtorprocess();
+virtual int64_t gettorpid() const;
+virtual bool istorconnected() const;
+virtual std::string gettorproxyuri() const;
+virtual std::string gettorversion() const;
+virtual void gettorlog(getlogcallback);
+virtual void setuppluggabletransport(const base::filepath& snowflake,
+                                       const base::filepath& obfs4);
+virtual void setupbridges(tor::bridgesconfig bridges_config);
+</code></pre>
+        <p>lines 28-37: these are the main things for starting and stopping tor. 'launchtorprocess' takes some config. 'setuppluggabletransport' and 'setupbridges' are for making tor work in bad places.</p>
+        <pre><code>  void addobserver(torlauncherobserver* observer);
+  void removeobserver(torlauncherobserver* observer);
+</code></pre>
+        <p>lines 39-40: looks like other parts of the browser get told when tor does stuff.</p>
+        <pre><code>  mojo::remote&lt;tor::mojom::torlauncher&gt; tor_launcher_;
+</code></pre>
+        <p>line 75: uses 'mojo'. probably means tor runs in its own box, separate from the browser. good for security.</p>
+    </section>
+
+    <section>
+        <h2>file: tor/onion_location_navigation_throttle.h</h2>
+        <p>this seems to be about websites ending in '.onion'.</p>
+        <pre><code>static std::unique_ptr&lt;onionlocationnavigationthrottle&gt;
+  maybecreatethrottlefor(content::navigationhandle* navigation_handle,
+                         bool is_tor_disabled,
+                         bool is_tor_profile);
+</code></pre>
+        <p>lines 17-20: only does something if tor is on and it's a tor profile. makes sense.</p>
+        <pre><code>throttlecheckresult willprocessresponse() override;
+throttlecheckresult willstartrequest() override;
+const char* getnameforlogging() override;
+</code></pre>
+        <p>lines 27-29: these look at when the browser is going to a new page and when it gets the page back. probably checking for onion stuff.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_navigation_throttle.cc</h2>
+        <p>more about going to websites with tor.</p>
+        <pre><code>if (!tor_launcher_factory_->istorconnected() &&
+        !url.schemeis(content::kchromeuischeme) &&
+        !skip_wait_for_tor_connected_for_testing_) {
+      resume_pending_ = true;
+      return content::navigationthrottle::defer;
+    }
+</code></pre>
+        <p>lines 54-59: if tor isn't ready, the browser waits before going to the page. except for internal browser pages. and there's a way to skip this for testing.</p>
+        <pre><code>return content::navigationthrottle::block_request;
+</code></pre>
+        <p>line 67: if it's not a normal website (like http or https) and it's tor, then block it. probably only wants web stuff through tor.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_constants.h</h2>
+        <p>just some simple words defined.</p>
+        <pre><code>inline constexpr const base::filepath::chartype ktorprofiledir[] =
+    file_path_literal("tor profile");
+
+inline constexpr char ktorprofileid[] = "tor::profile";
+</code></pre>
+        <p>lines 13-16: name of the folder and id for tor profile stuff.</p>
+    </section>
+
+    <section>
+        <h2>file: tor/onion_location_tab_helper.h</h2>
+        <p>looks like this helps keep track of the '.onion' address for the current tab.</p>
+        <pre><code>static void setonionlocation(content::webcontents* web_contents,
+                               const gurl& onion_location);
+
+bool should_show_icon() const { return !onion_location_.is_empty(); }
+
+gurl onion_location() const { return onion_location_; }
+</code></pre>
+        <p>lines 19-25: lets you set and get the onion address for a tab. maybe shows an icon if there's an onion site.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_file_watcher.cc</h2>
+        <p>this looks important for seeing when tor starts and is ready.</p>
+        <pre><code>void torfilewatcher::startwatching(watchcallback callback) {
+  dcheck_called_on_valid_sequence(owner_sequence_checker_);
+  watch_callback_ = std::move(callback);
+  watch_task_runner_->posttask(
+      from_here, base::bindonce(&torfilewatcher::startwatchingontaskrunner,
+                                weak_ptr_factory_.getweakptr()));
+}
+</code></pre>
+        <p>lines 61-68: starts watching files to see when tor is ready. does this on a separate thread.</p>
+        <pre><code>bool torfilewatcher::eatcontrolcookie(std::vector&lt;uint8_t&gt;& cookie,
+                                      base::time& mtime) {
+  // ...
+  base::file cookiefile(cookiepath,
+                        base::file::flag_open | base::file::flag_read);
+  if (!cookiefile.isvalid()) {
+    vlog(0) &lt;&lt; "tor: failed to open control auth cookie";
+    return false;
+  }
+  // ...
+  int nread = cookiefile.readatcurrentpos(buf, kbufsiz);
+  // ...
+  cookie.assign(buf, buf + nread);
+  mtime = info.last_accessed;
+  return true;
+}
+</code></pre>
+        <p>lines 173-215: reads the tor password (cookie) from a file. checks if it can open the file. reads only a little bit of it (33 bytes max). good to limit how much you read.</p>
+        <pre><code>bool torfilewatcher::eatcontrolport(int& port, base::time& mtime) {
+  // ...
+  base::file portfile(portpath, base::file::flag_open | base::file::flag_read);
+  if (!portfile.isvalid()) {
+    vlog(0) &lt;&lt; "tor: failed to open control port";
+    return false;
+  }
+  // ...
+  int nread = portfile.readatcurrentpos(buf, sizeof buf);
+  // ...
+  if (!text.starts_with("port=") || !text.ends_with(klinebreak)) {
+    vlog(0) &lt;&lt; "tor: invalid control port: "
+            &lt;&lt; "`" &lt;&lt; text &lt;&lt; ";";  // xxx escape
+    return false;
+  }
+  const char expected[] = "port=127.0.0.1:";
+  if (!text.starts_with(expected)) {
+    vlog(0) &lt;&lt; "tor: control port has non-local control address";
+    return false;
+  }
+  // ...
+  if (!base::stringtoint(portstr, &port)) {
+    vlog(0) &lt;&lt; "tor: failed to parse control port: "
+            &lt;&lt; "`" &lt;&lt; portstr &lt;&lt; "'";  // xxx escape
+    return false;
+  }
+  if (port > 65535) {
+    vlog(0) &lt;&lt; "tor: port overflow";
+    return false;
+  }
+  mtime = info.last_modified;
+  return true;
+}
+</code></pre>
+        <p>lines 220-307: reads the port number tor uses from a file. checks if it's in the right format ("port=..."). makes sure it's on your own computer (127.0.0.1). checks if the port number is too big. all these checks are good to stop bad stuff.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_utils.h</h2>
+        <p>some helper stuff for tor.</p>
+        <pre><code>struct bridgesconfig {
+  enum class usage {
+    knotused = 0,
+    kbuiltin = 1,
+    krequest = 2,
+    kprovide = 3,
+  };
+
+  enum class builtintype {
+    ksnowflake = 0,
+    kobfs4 = 1,
+    kmeekazure = 2,
+  };
+  // ...
+  usage use_bridges = usage::knotused;
+  builtintype use_builtin = builtintype::kobfs4;
+  std::map&lt;builtintype, std::vector&lt;std::string&gt;&gt; builtin_bridges;
+  std::vector&lt;std::string&gt; requested_bridges;
+  std::vector&lt;std::string&gt; provided_bridges;
+};
+</code></pre>
+        <p>lines 18-42: how tor uses 'bridges' to get around internet blocks. different ways to use them (built-in, you ask for them, you give them). also different types of built-in bridges.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_utils.cc</h2>
+        <p>how the helper stuff works.</p>
+        <pre><code>const std::vector&lt;std::string&gt;& getbuiltinbridges(
+    tor::bridgesconfig::builtintype type) {
+  // ...
+  static const base::nodestructor&lt;std::vector&lt;std::string&gt;&gt; ksnowflakebridges({...});
+  static const base::nodestructor&lt;std::vector&lt;std::string&gt;&gt; kobfs4briges({...});
+  static const base::nodestructor&lt;std::vector&lt;std::string&gt;&gt; kmeekazurebriges({...});
+  // ...
+  switch (type) {
+    case tor::bridgesconfig::builtintype::ksnowflake:
+      return *ksnowflakebridges;
+    case tor::bridgesconfig::builtintype::kobfs4:
+      return *kobfs4briges;
+    case tor::bridgesconfig::builtintype::kmeekazure:
+      return *kmeekazurebriges;
+  }
+}
+</code></pre>
+        <p>lines 69-107: this has the actual addresses of the built-in tor bridges. they are just listed here in the code. they need to keep this list updated. if someone put bad bridges here, that would be bad.</p>
+        <pre><code>std::optional&lt;bridgesconfig&gt; bridgesconfig::fromdict(
+    const base::value::dict& dict) {
+  // ...
+  result.use_bridges =
+      casttoenum&lt;usage&gt;(dict.findint(kusebridgeskey).value_or(0));
+
+  result.use_builtin =
+      casttoenum&lt;builtintype&gt;(dict.findint(kusebuiltinbridgeskey).value_or(1));
+
+  if (auto* bridges = dict.finddict(kbuiltinbridgeskey)) {
+    result.updatebuiltinbridges(*bridges);
+  }
+  result.provided_bridges = loadbridgeslist(dict.findlist(kprovidedbridgeskey));
+  result.requested_bridges =
+      loadbridgeslist(dict.findlist(krequestedbrigeskey));
+  return result;
+}
+</code></pre>
+        <p>lines 133-150: this reads the bridge settings from some stored place (like browser settings). they should be careful to only load good settings.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_launcher_factory.cc</h2>
+        <p>how the browser starts tor, part 2.</p>
+        <pre><code>content::serviceprocesshost::launch(
+      tor_launcher_.bindnewpipeandpassreceiver(),
+      content::serviceprocesshost::options()
+          .withdisplayname(ids_utility_process_tor_launcher_name)
+          .pass());
+</code></pre>
+        <p>lines 100-105: confirms tor runs in its own process. safer.</p>
+        <pre><code>void torlauncherfactory::launchtorprocess(const tor::mojom::torconfig& config) {
+  // ...
+  dcheck(!config.executable.path().empty());
+  dcheck(!config.install_dir.path().empty());
+  config_ = config;
+  // ...
+  launchtorinternal();
+}
+</code></pre>
+        <p>lines 120-136: when starting tor, it checks if the path to the tor program and where it's installed are not empty. basic check. need to make sure these paths are safe.</p>
+        <pre><code>void torlauncherfactory::ontorcontrolprerequisitesready(
+    int64_t pid,
+    bool ready,
+    std::vector&lt;uint8_t&gt; cookie,
+    int port) {
+  // ...
+  if (ready) {
+    control_->start(std::move(cookie), port);
+  } else {
+    // ... try again ...
+  }
+}
+</code></pre>
+        <p>lines 268-286: once it has the password (cookie) and port number for tor, it starts talking to tor. it tries again if it doesn't work at first.</p>
+        <pre><code>void torlauncherfactory::ontorevent(
+    tor::torcontrolevent event,
+    const std::string& initial,
+    const std::map&lt;std::string, std::string&gt;& extra) {
+  // ...
+  if (event == tor::torcontrolevent::status_client) {
+    if (initial.find(kstatusclientbootstrap) != std::string::npos) {
+      // ... what's tor doing ...
+    } else if (initial.find(kstatusclientcircuittestablished) !=
+               std::string::npos) {
+      // ... tor is connected ...
+    } else if (initial.find(kstatusclientcircuitnotestablished) !=
+               std::string::npos) {
+      // ... tor not connected ...
+    }
+  } else if (event == tor::torcontrolevent::notice ||
+             event == tor::torcontrolevent::warn ||
+             event == tor::torcontrolevent::err) {
+    tor_log_ += raw_event + '\n';
+    // ...
+  }
+}
+</code></pre>
+        <p>lines 340-384: this listens for messages from tor. it sees when tor is starting up, when it's connected, and if there are any problems (notices, warnings, errors). need to make sure these messages can't be faked to cause issues.</p>
+    </section>
+
+    <section>
+        <h2>file: tor/brave_tor_pluggable_transport_updater.cc</h2>
+        <p>how the browser updates those bridge helper programs.</p>
+        <pre><code>bool initialize(const base::filepath& install_dir) {
+  const auto executables = {install_dir.appendascii(ksnowflakeexecutablename),
+                            install_dir.appendascii(kobfs4executablename)};
+
+  for (const auto& executable : executables) {
+    if (!base::pathexists(executable)) {
+      log(error) &lt;&lt; executable &lt;&lt; " doesn't exist";
+      return false;
+    }
+#if buildflag(is_posix)
+    if (!base::setposixfilepermissions(executable, 0755)) {
+      log(error) &lt;&lt; "failed to set executable permission on " &lt;&lt; executable;
+      return false;
+    }
+#endif
+  }
+  return true;
+}
+</code></pre>
+        <p>lines 90-111: checks if the snowflake and obfs4 programs are there after an update. and makes sure they can run (permissions on linux/mac).</p>
+        <pre><code>void bravetorpuggabletransportupdater::oncomponentready(
+    const std::string& component_id,
+    const base::filepath& install_dir,
+    const std::string& manifest) {
+  gettaskrunner()->posttaskandreplywithresult(
+      from_here, base::bindonce(&initialize, install_dir),
+      base::bindonce(&bravetorpuggabletransportupdater::oninitialized,
+                     weak_ptr_factory_.getweakptr(), install_dir));
+}
+</code></pre>
+        <p>lines 154-161: when the browser gets a new version of these helper programs, it runs the 'initialize' function to check them.</p>
+    </section>
+
+    <section>
+        <h2>file: tor/brave_tor_client_updater.cc</h2>
+        <p>how the browser updates the main tor program.</p>
+        <pre><code>base::filepath inittorpath(const base::filepath& install_dir) {
+  base::filepath executable_path;
+  base::fileenumerator traversal(install_dir, false,
+                                 base::fileenumerator::files,
+                                 file_path_literal("tor-*"));
+  for (base::filepath current = traversal.next(); !current.empty();
+       current = traversal.next()) {
+    base::fileenumerator::fileinfo file_info = traversal.getinfo();
+    if (re2::fullmatch(
+            file_info.getname().maybeasascii(),
+            "tor-\\d+\\.\\d+\\.\\d+\\.\\d+-\\w+(-\\w+)?-brave-\\d+")) {
+      executable_path = current;
+    }
+    // ...
+  }
+  // ...
+#if buildflag(is_posix)
+  if (!base::setposixfilepermissions(executable_path, 0755)) {
+    // ...
+    return {};
+  }
+#endif  // buildflag(is_posix)
+  return executable_path;
+}
+</code></pre>
+        <p>lines 32-64: finds the tor program in the update folder. it looks for a filename that matches a pattern. this pattern should be very specific so it only picks the real tor program. also sets permissions on linux/mac.</p>
+        <pre><code>void bravetorclientupdater::oncomponentready(const std::string& component_id,
+                                             const base::filepath& install_dir,
+                                             const std::string& manifest) {
+  install_dir_ = install_dir;
+  gettaskrunner()->posttaskandreplywithresult(
+      from_here, base::bindonce(&inittorpath, install_dir),
+      base::bindonce(&bravetorclientupdater::onexecutablepathfound,
+                     weak_ptr_factory_.getweakptr()));
+}
+</code></pre>
+        <p>lines 114-121: when a new tor program is downloaded, it runs 'inittorpath' to find it.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_control.cc</h2>
+        <p>how the browser talks to the tor program.</p>
+        <pre><code>void torcontrol::start(std::vector&lt;uint8_t&gt; cookie, int port) {
+  // ...
+  net::addresslist addrlist = net::addresslist::createfromipaddress(
+      net::ipaddress::ipv4localhost(), port);
+  socket_ = std::make_unique&lt;net::tcpclientsocket&gt;(
+      addrlist, nullptr, nullptr, net::netlog::get(), net::netlogsource());
+  int rv = socket_->connect(base::bindonce(
+      &torcontrol::connected, weak_ptr_factory_.getweakptr(), cookie));
+  // ...
+}
+</code></pre>
+        <p>lines 130-144: starts the connection to tor. connects to '127.0.0.1' which is good, means it's only talking to tor on your own computer.</p>
+        <pre><code>void torcontrol::connected(std::vector&lt;uint8_t&gt; cookie, int rv) {
+  // ...
+  docmd("authenticate " + base::hexencode(cookie.data(), cookie.size()),
+        base::donothing(),
+        base::bindonce(&torcontrol::authenticated,
+                       weak_ptr_factory_.getweakptr()));
+}
+</code></pre>
+        <p>lines 166-176: after connecting, it sends the password (cookie) to tor to prove it's allowed to talk to it. the password is made into a string of letters and numbers.</p>
+        <pre><code>void torcontrol::docmd(std::string cmd,
+                       perlinecallback perline,
+                       cmdcallback callback) {
+  // ...
+  if (!socket_ || writeq_.size() > 100 || cmdq_.size() > 100) {
+    // socket is closed, or over 100 commands pending or synchronous
+    // callbacks queued -- something is probably wrong.
+    bool error = true;
+    std::move(callback).run(error, "", "");
+    return;
+  }
+  writeq_.push(cmd + "\r\n");
+  // ...
+}
+</code></pre>
+        <p>lines 320-334: sends commands to tor. it checks if there are too many commands waiting, which might mean something is wrong.</p>
+        <pre><code>bool torcontrol::readline(std::string_view line) {
+  // ...
+  if (status[0] == '6') {
+    // asynchronous reply.
+    // ... reads messages from tor that just happen ...
+  } else {
+    // synchronous reply.
+    // ... reads messages that are answers to commands ...
+  }
+  // ...
+}
+</code></pre>
+        <p>lines 567-718: reads the messages that tor sends back. it knows if it's just a general message or an answer to a question. this part needs to be very careful to understand tor's messages correctly. if it messes this up, bad things could happen.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_profile_service_impl.cc</h2>
+        <p>manages the tor profile in the browser.</p>
+        <pre><code>void torprofileserviceimpl::launchtor() {
+  auto install_dir =
+      base::safebasename::create(tor_client_updater_->install_dir());
+  check(install_dir) &lt;&lt; tor_client_updater_->install_dir();
+
+  auto executable =
+      base::safebasename::create(tor_client_updater_->executable());
+  check(executable) &lt;&lt; tor_client_updater_->executable();
+
+  tor_launcher_factory_->launchtorprocess(tor::mojom::torconfig(
+      std::move(install_dir).value(), std::move(executable).value()));
+}
+</code></pre>
+        <p>lines 286-298: starts the tor program using the path it got from the updater. tries to use safe names for the paths.</p>
+        <pre><code>void torprofileserviceimpl::setnewtorcircuit(webcontents* tab) {
+  // ...
+  proxy_config_service_->setnewtorcircuit(url);
+
+  // force lookup to erase the old circuit ...
+  auto* storage_partition = context_->getstoragepartitionforurl(url, false);
+  // ...
+  storage_partition->getnetworkcontext()->lookupproxyforurl(
+      url, network_anonymization_key, std::move(proxy_lookup_client));
+}
+</code></pre>
+        <p>lines 321-346: tells tor to make a new connection path. this helps keep you anonymous.</p>
+    </section>
+
+    <section>
+        <h2>file: tor/renderer/onion_domain_throttle.cc</h2>
+        <p>stops websites ending in '.onion' from loading in normal browser windows.</p>
+        <pre><code>void oniondomainthrottle::willstartrequest(network::resourcerequest* request,
+                                           bool* defer) {
+  if (net::isonion(request->url)) {
+    delegate_->cancelwitherror(net::err_blocked_by_client);
+  }
+}
+</code></pre>
+        <p>lines 25-30: checks if the website address ends in '.onion'. if it does, and you're not in a tor window, it stops the page from loading. this makes sure onion sites only go through tor.</p>
+    </section>
+
+</body>
+</html>
