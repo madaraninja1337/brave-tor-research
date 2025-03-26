@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>tor integration security notes - take three, more stuff</title>
+</head>
+<body>
+    <h1>tor integration security notes - this is getting long</h1>
+
+    <section>
+        <h2>file: tor_control_event.h</h2>
+        <p>looking at the names of all the things tor can tell us.</p>
+        <pre><code>enum class torcontrolevent {
+  invalid,
+#define tor_event(n) n,
+#include "tor_control_event_list.h"  /* noline(build/include_directory) */
+#undef tor_event
+};
+
+extern const std::map&lt;std::string, torcontrolevent&gt; ktorcontroleventbyname;
+extern const std::map&lt;torcontrolevent, std::string&gt; ktorcontroleventbyenum;
+</code></pre>
+        <p>lines 11-20: this file just lists all the different 'events' that the tor program can send. like when a new connection happens, or when something goes wrong. there's a big list in that other file 'tor_control_event_list.h'. gotta make sure the browser understands all these correctly.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_control_event.cc</h2>
+        <p>how the browser knows the names of those tor events.</p>
+        <pre><code>const std::map&lt;std::string, torcontrolevent&gt; ktorcontroleventbyname = {
+#define tor_event(n) {#n, torcontrolevent::n},
+#include "tor_control_event_list.h"  // noline
+#undef tor_event
+};
+
+const std::map&lt;torcontrolevent, std::string&gt; ktorcontroleventbyenum = {
+  {torcontrolevent::invalid, "(invalid)"},
+#define tor_event(n) {torcontrolevent::n, #n},
+#include "tor_control_event_list.h"  // noline
+#undef tor_event
+};
+</code></pre>
+        <p>lines 9-21: this code makes a list that connects the text name of an event (like "CIRC") to a number inside the program. and it does the reverse too (number back to name). this is important so the browser knows what tor is talking about.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_file_watcher.h</h2>
+        <p>more on watching for tor to be ready.</p>
+        <pre><code>class torfilewatcher {
+ public:
+  using watchcallback = base::oncecallback&lt;
+      void(bool success, std::vector&lt;uint8_t&gt; cookie, int port)&gt;;
+
+  explicit torfilewatcher(base::filepath watch_dir_path);
+
+  ~torfilewatcher();
+
+  // caller should use base::bindposttask to make
+  // sure callback will be ran on the dedicated thread.
+  void startwatching(watchcallback);
+
+ private:
+  // ... some friend classes for testing ...
+  void startwatchingontaskrunner();
+  void onwatchdirchanged(const base::filepath& path, bool error);
+  void poll();
+  void polldone();
+  bool eatcontrolcookie(std::vector&lt;uint8_t&gt;&, base::time&);
+  bool eatcontrolport(int&, base::time&);
+
+  sequence_checker(owner_sequence_checker_);
+  sequence_checker(watch_sequence_checker_);
+
+  bool polling_;
+  bool repoll_;
+  base::filepath watch_dir_path_;
+
+  watchcallback watch_callback_;
+
+  const scoped_refptr&lt;base::sequencedtaskrunner&gt; watch_task_runner_;
+  std::unique_ptr&lt;base::filepathwatcher, base::ontaskrunnerdeleter&gt; watcher_;
+
+  base::weakptrfactory&lt;torfilewatcher&gt; weak_ptr_factory_{this};
+
+  torfilewatcher(const torfilewatcher&) = delete;
+  torfilewatcher& operator=(const torfilewatcher&) = delete;
+};
+</code></pre>
+        <p>lines 16-57: this is the definition of the class that watches for tor. it has a callback that gets run when it thinks tor is ready. it watches a directory for changes. it tries to 'eat' the cookie and the port number. it uses different threads to do this. looks like it tries again if things don't work the first time ('repoll_').</p>
+    </section>
+
+    <section>
+        <h2>file: tor_launcher_observer.h</h2>
+        <p>what other parts of the browser care about tor starting and stopping.</p>
+        <pre><code>class torlauncherobserver : public base::checkedobserver {
+ public:
+  ~torlauncherobserver() override {}
+
+  virtual void ontorlaunchercrashed() {}
+  virtual void ontorcrashed(int64_t pid) {}
+  virtual void ontorlaunched(bool result, int64_t pid) {}
+  virtual void ontorcontrolready() {}
+  virtual void ontornewproxyuri(const std::string& uri) {}
+  virtual void ontorcircuittestablished(bool result) {}
+  virtual void ontorinitializing(const std::string& percentage,
+                                 const std::string& message) {}
+  virtual void ontorcontrolevent(const std::string& event) {}
+  virtual void ontorlogupdated() {}
+};
+</code></pre>
+        <p>lines 8-21: this lists all the things that other parts of the browser might want to know about tor. like if the tor launcher crashes, if the tor program itself crashes, when tor starts, when it gets a new address to use, when it makes a connection, how much of it has started up, and when it sends any kind of message.</p>
+    </section>
+
+    <section>
+        <h2>file: tor/brave_tor_pluggable_transport_updater.h</h2>
+        <p>more on updating those bridge helpers.</p>
+        <pre><code>class bravetorpuggabletransportupdater : public bravecomponent {
+ public:
+  class observer : public base::checkedobserver {
+   public:
+    virtual void onpluggabletransportready(bool success) {}
+
+   protected:
+    ~observer() override = default;
+  };
+
+  bravetorpuggabletransportupdater(
+      bravecomponent::delegate* component_delegate,
+      prefservice* local_state,
+      const base::filepath& user_data_dir);
+  bravetorpuggabletransportupdater(const bravetorpuggabletransportupdater&) =
+      delete;
+  bravetorpuggabletransportupdater& operator=(
+      const bravetorpuggabletransportupdater&) = delete;
+  ~bravetorpuggabletransportupdater() override;
+
+  void register();
+  void unregister();
+  void cleanup();
+
+  bool isready() const;
+  const base::filepath& getsnowflakeexecutable() const;
+  const base::filepath& getobfs4executable() const;
+
+  void addobserver(observer* observer);
+  void removeobserver(observer* observer);
+
+ protected:
+  void oncomponentready(const std::string& component_id,
+                        const base::filepath& install_dir,
+                        const std::string& manifest) override;
+
+ private:
+  void oninitialized(const base::filepath& install_dir, bool succeeded);
+
+  bool registered_ = false;
+  bool is_ready_ = false;
+
+  base::observerlist&lt;observer&gt; observers_;
+  raw_ptr&lt;prefservice&gt; local_state_ = nullptr;
+  base::filepath user_data_dir_;
+  base::filepath snowflake_path_;  // relative to the user data dir
+  base::filepath obfs4_path_;      // relative to the user data dir
+
+  base::weakptrfactory&lt;bravetorpuggabletransportupdater&gt; weak_ptr_factory_{
+      this};
+};
+</code></pre>
+        <p>lines 18-67: this defines how the browser updates those bridge helper programs (snowflake and obfs4). it has a way for other parts of the browser to know when these programs are ready to use. it keeps track of where these programs are installed. it can register and unregister itself for updates. and it has a cleanup function to remove old versions.</p>
+    </section>
+
+    <section>
+        <h2>file: tor/brave_tor_client_updater.h</h2>
+        <p>more on updating the main tor program.</p>
+        <pre><code>class bravetorclientupdater : public bravecomponent {
+ public:
+  class observer : public base::checkedobserver {
+   public:
+    virtual void onexecutableready(const base::filepath& path) = 0;
+
+   protected:
+    ~observer() override = default;
+  };
+
+  bravetorclientupdater(bravecomponent::delegate* component_delegate,
+                        prefservice* local_state,
+                        const base::filepath& user_data_dir);
+  bravetorclientupdater(const bravetorclientupdater&) = delete;
+  bravetorclientupdater& operator=(const bravetorclientupdater&) = delete;
+  ~bravetorclientupdater() override;
+
+  void register();
+  void unregister();
+  void cleanup();
+  scoped_refptr&lt;base::sequencedtaskrunner&gt; gettaskrunner() {
+    return task_runner_;
+  }
+
+  const base::filepath& install_dir() const { return install_dir_; }
+  const base::filepath& executable() const { return executable_; }
+
+  void addobserver(observer* observer);
+  void removeobserver(observer* observer);
+
+ protected:
+  void oncomponentready(const std::string& component_id,
+      const base::filepath& install_dir,
+      const std::string& manifest) override;
+  bool istordisabled();
+
+ private:
+  void removeobsoletefiles();
+
+  // called with a response for the search for the executable path.
+  void onexecutablepathfound(base::filepath path);
+
+  scoped_refptr&lt;base::sequencedtaskrunner&gt; task_runner_;
+  bool registered_;
+
+  // the path where the binary has been ultimately installed.
+  base::filepath install_dir_;
+
+  // the path for the tor executable.
+  base::filepath executable_;
+
+  base::observerlist&lt;observer&gt; observers_;
+  raw_ptr&lt;prefservice&gt; local_state_ = nullptr;
+  base::filepath user_data_dir_;
+
+  base::weakptrfactory&lt;bravetorclientupdater&gt; weak_ptr_factory_;
+};
+</code></pre>
+        <p>lines 18-70: this defines how the browser updates the main tor program. it has a way for other parts of the browser to know when the new tor program is ready. it keeps track of where tor is installed. it can register and unregister itself for updates. it has a cleanup function and a function to remove old files. it also checks if tor is disabled in the settings.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_tab_helper.cc</h2>
+        <p>helps manage tor for each browser tab.</p>
+        <pre><code>void tortabhelper::didfinishnavigation(
+    content::navigationhandle* navigation_handle) {
+  // we will keep retrying every second if we can't establish connection to tor
+  // process. this is possible when tor is launched but not yet ready to accept
+  // new connection or some fatal errors within tor process
+  if (navigation_handle->getneterrorcode() != net::err_proxy_connection_failed)
+    return;
+  base::sequencedtaskrunner::getcurrentdefault()->postdelayedtask(
+      from_here,
+      base::bindonce(&tortabhelper::reloadtab, weak_ptr_factory_.getweakptr(),
+                     navigation_handle->getwebcontents()),
+      base::seconds(1));
+}
+</code></pre>
+        <p>lines 30-41: if the browser tries to load a page through tor and it fails because it can't connect to the tor program, this code will try again every second. this is probably to handle cases where tor takes a little while to start up.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_switches.h</h2>
+        <p>command line options for tor.</p>
+        <pre><code>inline constexpr char kdisabletorclientupdaterextension[] =
+    "disable-tor-client-updater-extension";
+</code></pre>
+        <p>lines 11-12: this defines a command line option that can be used to turn off the tor client updater. this might be useful for testing or if a user really doesn't want tor to be updated automatically.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_profile_service.cc</h2>
+        <p>more on managing the tor profile.</p>
+        <pre><code>void torprofileservice::registerlocalstateprefs(prefregistrysimple* registry) {
+  registry->registerbooleanpref(prefs::ktordisabled, false);
+  registry->registerdictionarypref(prefs::kbridgesconfig);
+  registry->registertimepref(prefs::kbuiltinbridgesrequesttime, base::time());
+}
+
+// static
+void torprofileservice::registerprofileprefs(prefregistrysimple* registry) {
+  registry->registerbooleanpref(prefs::kautoonionredirect, false);
+  registry->registerbooleanpref(prefs::koniononlyintorwindows, true);
+}
+</code></pre>
+        <p>lines 16-28: this code registers some settings (preferences) that are specific to tor. some are for the whole browser ('local state') like whether tor is disabled and the bridge settings. others are for each profile, like whether to automatically go to the onion site if it's available and whether to only allow onion sites in tor windows.</p>
+    </section>
+
+    <section>
+        <h2>file: tor_profile_service_impl.cc</h2>
+        <p>how the tor profile service actually works.</p>
+        <pre><code>class newtorcircuittracker : public webcontentsobserver {
+ public:
+  explicit newtorcircuittracker(content::webcontents* web_contents)
+      : webcontentsobserver(web_contents) {}
+  newtorcircuittracker(const newtorcircuittracker&) = delete;
+  newtorcircuittracker& operator=(const newtorcircuittracker&) = delete;
+  ~newtorcircuittracker() override = default;
+
+  void newidentityloaded(bool success) {
+    if (web_contents()) {
+      if (success) {
+        content::navigationcontroller& controller = web_contents()->getcontroller();
+        controller.reload(content::reloadtype::bypassing_cache, true);
+      } else {
+        log(warning) &lt;&lt; "failed to set new tor circuit";
+        // todo(bridiver) - the webcontents still exists so we need to notify
+        // the user, not just log and return;
+      }
+    }
+  }
+};
+</code></pre>
+        <p>lines 30-50: this little class helps when you ask for a new tor circuit. it watches the current web page and if the new circuit is made okay, it reloads the page. if it fails, it logs a warning (but it looks like they need to add a way to tell the user).</p>
+        <pre><code>void torprofileserviceimpl::setnewtorcircuit(webcontents* tab) {
+  dcheck_currently_on(content::browserthread::ui);
+  // track the webcontents lifetime so we don't reload if it has already
+  // been destroyed
+  auto tracker = std::make_unique&lt;newtorcircuittracker&gt;(tab);
+  auto callback = base::bindonce(&onnewtorcircuit, std::move(tracker));
+
+  const gurl& url = tab->geturl();
+
+  proxy_config_service_->setnewtorcircuit(url);
+
+  // force lookup to erase the old circuit and also get a callback
+  // so we know when it is safe to reload the tab
+  auto* storage_partition = context_->getstoragepartitionforurl(url, false);
+  if (!storage_partition) {
+    storage_partition = context_->getdefaultstoragepartition();
+  }
+  auto proxy_lookup_client =
+      torproxylookupclient::createtorproxylookupclient(std::move(callback));
+  const net::schemefulsite url_site(url);
+  const auto network_anonymization_key =
+      net::networkanonymizationkey::createfromframesite(url_site, url_site);
+  storage_partition->getnetworkcontext()->lookupproxyforurl(
+      url, network_anonymization_key, std::move(proxy_lookup_client));
+}
+</code></pre>
+        <p>lines 316-349: this is the main function that asks for a new tor circuit. it creates that 'newtorcircuittracker' to handle the reload. it tells the proxy settings to use a new circuit. then it does some stuff to make sure the browser really uses the new circuit. looks like it's making sure to use the right network settings for the current page.</p>
+        <pre><code>std::unique_ptr&lt;net::proxyconfigservice&gt;
+torprofileserviceimpl::createproxyconfigservice() {
+  // first tor profile will have empty proxy uri but it will receive update from
+  // notifytornewproxyuri. and subsequent tor profile might not have
+  // notifytornewproxyuri because it is called once when tor control is ready.
+  const std::string tor_proxy_uri = tor_launcher_factory_->gettorproxyuri();
+  if (tor_proxy_uri.empty()) {
+    proxy_config_service_ = new net::proxyconfigservicetor();
+  } else {
+    proxy_config_service_ = new net::proxyconfigservicetor(tor_proxy_uri);
+  }
+  return std::unique_ptr&lt;net::proxyconfigservicetor&gt;(proxy_config_service_);
+}
+</code></pre>
+        <p>lines 390-404: this creates the thing that tells the browser to use tor as the proxy. it checks if it already knows the address to use for tor. if it doesn't, it will get it later. this is how the browser knows to send all your web traffic through tor when you're in a tor window.</p>
+    </section>
+
+</body>
+</html>
