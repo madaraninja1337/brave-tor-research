@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+  <title>Malicious Feed</title>
+  <link>http://example.com</link>
+  <description>This feed contains an XSS payload.</description>
+  <item>
+    <title>Click Me</title>
+    <link>https://example.com/article1</link>
+    <description>This is a normal article.</description>
+  </item>
+  <item>
+    <title>XSS Article</title>
+    <link>javascript:alert('XSS!')</link>
+    <description>This article contains an XSS payload.</description>
+  </item>
+</channel>
+</rss>
